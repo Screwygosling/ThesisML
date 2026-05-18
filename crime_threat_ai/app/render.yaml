@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: crime-threat-api
+    env: python
+    startCommand: gunicorn app:app
+    plan: free
