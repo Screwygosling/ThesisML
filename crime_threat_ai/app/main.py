@@ -6,7 +6,7 @@ from datetime import datetime
 
 app = Flask(__name__)
 
-MODEL_PATH = os.path.join(os.path.dirname(__file__), 'models', 'crime_penalty_model.pkl')
+MODEL_PATH = os.path.join(os.path.dirname(__file__), '..', 'models', 'crime_penalty_model.pkl')
 
 try:
     with open(MODEL_PATH, 'rb') as f:
