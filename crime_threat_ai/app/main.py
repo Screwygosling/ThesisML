@@ -2,11 +2,14 @@ from flask import Flask, request, jsonify
 import pickle
 import numpy as np
 import os
+import csv
+from collections import defaultdict
 from datetime import datetime
 
 app = Flask(__name__)
 
 MODEL_PATH = os.path.join(os.path.dirname(__file__), '..', 'models', 'crime_penalty_model.pkl')
+DATA_CSV_PATH = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'raw', 'crime_data.csv'))
 
 try:
     with open(MODEL_PATH, 'rb') as f:
@@ -31,90 +34,67 @@ def penalty_to_threat(penalty_score):
         return 'very high', round(min(0.85 + (penalty_score - 75) / 25 * 0.15, 1.0), 4)
 
 
-# ── barangay data ─────────────────────────────────────────────────────────────
-# barangay_encoded: alphabetical index from df["barangay"].astype("category").cat.codes
-# municipal_encoded: 0 for all (PASAY CITY is the only municipality)
-# areaCrimeCount: exact values from df.groupby("barangay").size()
-# crime_severity: 3 for high-crime barangays (count >= 10), 2 for others
+# ── barangay data (loaded from CSV) ──────────────────────────────────────────
+def load_barangays_from_csv(csv_path):
+    """Aggregate raw incident CSV into barangay-level entries used by the app."""
+    groups = defaultdict(lambda: {'count': 0, 'lat_sum': 0.0, 'lng_sum': 0.0, 'victim_sum': 0})
 
-BARANGAYS = [
-    {'name': 'BARANGAY 1',   'lat': 14.5600, 'lng': 121.0010, 'barangay_encoded': 0,  'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 10',  'lat': 14.5590, 'lng': 121.0015, 'barangay_encoded': 1,  'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 110', 'lat': 14.5430, 'lng': 121.0120, 'barangay_encoded': 2,  'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 114', 'lat': 14.5420, 'lng': 121.0130, 'barangay_encoded': 3,  'areaCrimeCount': 2,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 12',  'lat': 14.5585, 'lng': 121.0020, 'barangay_encoded': 4,  'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 120', 'lat': 14.5410, 'lng': 121.0140, 'barangay_encoded': 5,  'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 13',  'lat': 14.5580, 'lng': 121.0025, 'barangay_encoded': 6,  'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 130', 'lat': 14.5400, 'lng': 121.0150, 'barangay_encoded': 7,  'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 131', 'lat': 14.5395, 'lng': 121.0155, 'barangay_encoded': 8,  'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 14',  'lat': 14.5575, 'lng': 121.0030, 'barangay_encoded': 9,  'areaCrimeCount': 2,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 140', 'lat': 14.5385, 'lng': 121.0165, 'barangay_encoded': 10, 'areaCrimeCount': 2,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 144', 'lat': 14.5375, 'lng': 121.0170, 'barangay_encoded': 11, 'areaCrimeCount': 6,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 145', 'lat': 14.5370, 'lng': 121.0175, 'barangay_encoded': 12, 'areaCrimeCount': 3,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 146', 'lat': 14.5365, 'lng': 121.0180, 'barangay_encoded': 13, 'areaCrimeCount': 2,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 147', 'lat': 14.5360, 'lng': 121.0185, 'barangay_encoded': 14, 'areaCrimeCount': 3,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 148', 'lat': 14.5355, 'lng': 121.0190, 'barangay_encoded': 15, 'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 149', 'lat': 14.5350, 'lng': 121.0195, 'barangay_encoded': 16, 'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 150', 'lat': 14.5345, 'lng': 121.0200, 'barangay_encoded': 17, 'areaCrimeCount': 2,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 152', 'lat': 14.5340, 'lng': 121.0205, 'barangay_encoded': 18, 'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 157', 'lat': 14.5335, 'lng': 121.0210, 'barangay_encoded': 19, 'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 159', 'lat': 14.5330, 'lng': 121.0215, 'barangay_encoded': 20, 'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 162', 'lat': 14.5325, 'lng': 121.0220, 'barangay_encoded': 21, 'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 163', 'lat': 14.5320, 'lng': 121.0225, 'barangay_encoded': 22, 'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 165', 'lat': 14.5315, 'lng': 121.0230, 'barangay_encoded': 23, 'areaCrimeCount': 2,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 166', 'lat': 14.5310, 'lng': 121.0235, 'barangay_encoded': 24, 'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 168', 'lat': 14.5305, 'lng': 121.0240, 'barangay_encoded': 25, 'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 170', 'lat': 14.5300, 'lng': 121.0245, 'barangay_encoded': 26, 'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 171', 'lat': 14.5295, 'lng': 121.0250, 'barangay_encoded': 27, 'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 172', 'lat': 14.5290, 'lng': 121.0255, 'barangay_encoded': 28, 'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 173', 'lat': 14.5285, 'lng': 121.0260, 'barangay_encoded': 29, 'areaCrimeCount': 2,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 175', 'lat': 14.5280, 'lng': 121.0265, 'barangay_encoded': 30, 'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 176', 'lat': 14.5325, 'lng': 121.0106, 'barangay_encoded': 31, 'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 178', 'lat': 14.5270, 'lng': 121.0275, 'barangay_encoded': 32, 'areaCrimeCount': 3,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 179', 'lat': 14.5265, 'lng': 121.0280, 'barangay_encoded': 33, 'areaCrimeCount': 2,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 180', 'lat': 14.5260, 'lng': 121.0285, 'barangay_encoded': 34, 'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 183', 'lat': 14.5299, 'lng': 121.0151, 'barangay_encoded': 35, 'areaCrimeCount': 15, 'crime_severity': 3, 'victimCount': 2},
-    {'name': 'BARANGAY 184', 'lat': 14.5250, 'lng': 121.0295, 'barangay_encoded': 36, 'areaCrimeCount': 2,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 186', 'lat': 14.5245, 'lng': 121.0300, 'barangay_encoded': 37, 'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 188', 'lat': 14.5240, 'lng': 121.0305, 'barangay_encoded': 38, 'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 190', 'lat': 14.5235, 'lng': 121.0310, 'barangay_encoded': 39, 'areaCrimeCount': 2,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 191', 'lat': 14.5230, 'lng': 121.0315, 'barangay_encoded': 40, 'areaCrimeCount': 2,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 192', 'lat': 14.5225, 'lng': 121.0320, 'barangay_encoded': 41, 'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 193', 'lat': 14.5220, 'lng': 121.0325, 'barangay_encoded': 42, 'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 194', 'lat': 14.5215, 'lng': 121.0330, 'barangay_encoded': 43, 'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 195', 'lat': 14.5210, 'lng': 121.0335, 'barangay_encoded': 44, 'areaCrimeCount': 2,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 197', 'lat': 14.5205, 'lng': 121.0340, 'barangay_encoded': 45, 'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 201', 'lat': 14.5200, 'lng': 121.0345, 'barangay_encoded': 46, 'areaCrimeCount': 3,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 27',  'lat': 14.5560, 'lng': 120.9980, 'barangay_encoded': 47, 'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 32',  'lat': 14.5550, 'lng': 120.9970, 'barangay_encoded': 48, 'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 33',  'lat': 14.5545, 'lng': 120.9965, 'barangay_encoded': 49, 'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 35',  'lat': 14.5540, 'lng': 120.9960, 'barangay_encoded': 50, 'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 38',  'lat': 14.5535, 'lng': 120.9955, 'barangay_encoded': 51, 'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 39',  'lat': 14.5530, 'lng': 120.9950, 'barangay_encoded': 52, 'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 4',   'lat': 14.5569, 'lng': 120.9991, 'barangay_encoded': 53, 'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 40',  'lat': 14.5525, 'lng': 120.9945, 'barangay_encoded': 54, 'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 41',  'lat': 14.5520, 'lng': 120.9940, 'barangay_encoded': 55, 'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 44',  'lat': 14.5515, 'lng': 120.9935, 'barangay_encoded': 56, 'areaCrimeCount': 2,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 46',  'lat': 14.5510, 'lng': 120.9930, 'barangay_encoded': 57, 'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 47',  'lat': 14.5510, 'lng': 120.9903, 'barangay_encoded': 58, 'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 49',  'lat': 14.5505, 'lng': 120.9920, 'barangay_encoded': 59, 'areaCrimeCount': 2,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 56',  'lat': 14.5500, 'lng': 120.9915, 'barangay_encoded': 60, 'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 60',  'lat': 14.5495, 'lng': 120.9910, 'barangay_encoded': 61, 'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 62',  'lat': 14.5490, 'lng': 120.9905, 'barangay_encoded': 62, 'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 7',   'lat': 14.5595, 'lng': 121.0005, 'barangay_encoded': 63, 'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 70',  'lat': 14.5485, 'lng': 120.9900, 'barangay_encoded': 64, 'areaCrimeCount': 2,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 75',  'lat': 14.5480, 'lng': 120.9895, 'barangay_encoded': 65, 'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 76',  'lat': 14.5542, 'lng': 120.9893, 'barangay_encoded': 66, 'areaCrimeCount': 34, 'crime_severity': 3, 'victimCount': 2},
-    {'name': 'BARANGAY 79',  'lat': 14.5470, 'lng': 120.9885, 'barangay_encoded': 67, 'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 81',  'lat': 14.5465, 'lng': 120.9880, 'barangay_encoded': 68, 'areaCrimeCount': 3,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 83',  'lat': 14.5460, 'lng': 120.9875, 'barangay_encoded': 69, 'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 84',  'lat': 14.5455, 'lng': 120.9870, 'barangay_encoded': 70, 'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 90',  'lat': 14.5450, 'lng': 120.9865, 'barangay_encoded': 71, 'areaCrimeCount': 2,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 92',  'lat': 14.5445, 'lng': 120.9860, 'barangay_encoded': 72, 'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 95',  'lat': 14.5440, 'lng': 120.9855, 'barangay_encoded': 73, 'areaCrimeCount': 1,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 97',  'lat': 14.5435, 'lng': 120.9850, 'barangay_encoded': 74, 'areaCrimeCount': 2,  'crime_severity': 2, 'victimCount': 1},
-    {'name': 'BARANGAY 98',  'lat': 14.5430, 'lng': 120.9845, 'barangay_encoded': 75, 'areaCrimeCount': 2,  'crime_severity': 2, 'victimCount': 1},
-]
+    try:
+        with open(csv_path, newline='', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                barangay = (row.get('barangay') or '').strip().upper()
+                if not barangay:
+                    continue
+                try:
+                    lat = float(row.get('lat') or 0)
+                    lng = float(row.get('lng') or 0)
+                except ValueError:
+                    # skip rows with invalid coordinates
+                    continue
+                try:
+                    victim = int(row.get('victimCount') or 0)
+                except ValueError:
+                    victim = 0
+
+                g = groups[barangay]
+                g['count'] += 1
+                g['lat_sum'] += lat
+                g['lng_sum'] += lng
+                g['victim_sum'] += victim
+
+    except FileNotFoundError:
+        print(f"❌ CSV not found at {csv_path}. Falling back to empty barangays list.")
+        return []
+
+    # Build list with deterministic encoding
+    names = sorted(groups.keys())
+    barangays = []
+    for idx, name in enumerate(names):
+        g = groups[name]
+        count = g['count']
+        avg_lat = g['lat_sum'] / count if count else 0.0
+        avg_lng = g['lng_sum'] / count if count else 0.0
+        areaCrimeCount = count
+        crime_severity = 3 if areaCrimeCount >= 10 else 2
+        victimCount = g['victim_sum']
+
+        barangays.append({
+            'name': name,
+            'lat': round(avg_lat, 6),
+            'lng': round(avg_lng, 6),
+            'barangay_encoded': idx,
+            'areaCrimeCount': areaCrimeCount,
+            'crime_severity': crime_severity,
+            'victimCount': victimCount,
+        })
+
+    return barangays
+
+
+# Load barangays from CSV at startup (fallback to empty list if missing)
+BARANGAYS = load_barangays_from_csv(DATA_CSV_PATH)
+
 
 
 # ── routes ────────────────────────────────────────────────────────────────────
