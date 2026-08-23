@@ -2,24 +2,38 @@ import osmnx as ox
 import networkx as nx
 import numpy as np
 from functools import lru_cache
-
-print("Loading Pasay road network...")
-try:
-    G = ox.graph_from_bbox(bbox=(14.570, 14.505, 121.040, 120.975),network_type="drive")
-    G = ox.add_edge_speeds(G)
-    G = ox.add_edge_travel_times(G)
-    print(f"Road netwwork loadedd: {len(G.nodes)} nodes, {len(G.edges)} edges")
-except TypeError:
+ 
+# ── Load Pasay road network once at startup ───────────────────────────────────
+# osmnx downloads from OpenStreetMap and caches locally after first run
+print(f"Loading Pasay road network... OSMnx version: {ox.__version__}")
+ 
+# Pasay City bounding box
+NORTH, SOUTH, EAST, WEST = 14.570, 14.505, 121.040, 120.975
+ 
+G = None
+# Try every known OSMnx bbox API signature across versions
+_attempts = [
+    # v2.0+ keyword bbox tuple
+    lambda: ox.graph_from_bbox(bbox=(NORTH, SOUTH, EAST, WEST), network_type='drive'),
+    # v1.x positional args
+    lambda: ox.graph_from_bbox(NORTH, SOUTH, EAST, WEST, network_type='drive'),
+    # v2.x with named params
+    lambda: ox.graph_from_bbox(north=NORTH, south=SOUTH, east=EAST, west=WEST, network_type='drive'),
+]
+ 
+for attempt in _attempts:
     try:
-        G = ox.graph_from_bbox(14.570, 14.505, 121.040, 120.975, network_type="drive")
+        G = attempt()
         G = ox.add_edge_speeds(G)
         G = ox.add_edge_travel_times(G)
-        print(f"Rooad network loaded (legacy API): {len(G.nodes)} nodes, {len(G.edges)} edges")
-    except Exception as e2:
-        print(f"Failed to loadd road network: {e2}")
-except Exception as e:
-    print(f"Failed  to load road network: {e}")
-    G = None
+        print(f"✅ Road network loaded: {len(G.nodes)} nodes, {len(G.edges)} edges")
+        break
+    except Exception as e:
+        print(f"  attempt failed: {e}")
+        G = None
+ 
+if G is None:
+    print("❌ All road network loading attempts failed — /safe-route will return 503")
     
 # Crime Penalty Lookup
 

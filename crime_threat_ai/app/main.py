@@ -312,7 +312,7 @@ def route():
     except Exception as e:
         return jsonify({'error': f'Route calculation failed: {str(e)}'}), 500
 
-@app.route('/safe_routes', methods=['POST'])
+@app.route('/safe-routes', methods=['POST'])
 def safe_route():
     """
     Expects JSON:
@@ -347,11 +347,11 @@ def safe_route():
             features = np.array([[b['lat'], 
                                 b['lng'], month, day_of_week, hour,
                                 b['areaCrimeCount'], 
-                                b['baranagay_encoded'], 0,
+                                b['barangay_encoded'], 0,
                                 b['victimCount'], 
                                 b['crime_severity']
                                             ]])
-            penalty = float(model.predictt(features)[0])
+            penalty = float(model.predict(features)[0])
             heatmap_points.append({
                 'lat': b['lat'],
                 'lng': b['lng'],
@@ -364,7 +364,7 @@ def safe_route():
             heatmap_points
         )
 
-        return jsonify({'routes': routes, 'generated_at': now.isoformats()})
+        return jsonify({'routes': routes, 'generated_at': now.isoformat()})
     except ValueError as e:
         return jsonify({'error': str(e)}), 400
     except Exception as e:
