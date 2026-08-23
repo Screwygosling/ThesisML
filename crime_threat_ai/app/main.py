@@ -313,7 +313,7 @@ def route():
         return jsonify({'error': f'Route calculation failed: {str(e)}'}), 500
 
 @app.route('/safe-routes', methods=['POST'])
-def safe_route():
+def safe_route_endpoint():
     """
     Expects JSON:
     {
