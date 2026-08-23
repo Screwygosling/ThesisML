@@ -1,172 +1,225 @@
-import osmnx as ox
+# safe_route.py
+# Crime-weighted A* routing using OSM road network via Overpass API
+# Bypasses OSMnx geocoding entirely — uses direct Overpass query
+
 import networkx as nx
-import numpy as np
-from functools import lru_cache
+import requests
+import math
+import json
+import os
 
-# ── Load Pasay road network once at startup ───────────────────────────────────
-# osmnx downloads from OpenStreetMap and caches locally after first run
-print(f"Loading Pasay road network... OSMnx version: {ox.__version__}")
+CACHE_FILE = '/tmp/pasay_graph.json'
 
-# Pasay City bounding box
-NORTH, SOUTH, EAST, WEST = 14.570, 14.505, 121.040, 120.975
+# ── Haversine distance in metres ──────────────────────────────────────────────
+def haversine(a, b):
+    R = 6371000
+    dLat = math.radians(b[0] - a[0])
+    dLng = math.radians(b[1] - a[1])
+    s = (math.sin(dLat/2)**2 +
+         math.cos(math.radians(a[0])) *
+         math.cos(math.radians(b[0])) *
+         math.sin(dLng/2)**2)
+    return R * 2 * math.atan2(math.sqrt(s), math.sqrt(1-s))
 
-G = None
-try:
-    # OSMnx 1.9.x uses a polygon/point query — use graph_from_point with dist
-    # Centre of Pasay City, dist=3000m covers the whole city
-    G = ox.graph_from_point(
-        (14.5378, 120.9974),  # Pasay City centre
-        dist=3500,
-        network_type='drive'
-    )
-    G = ox.add_edge_speeds(G)
-    G = ox.add_edge_travel_times(G)
-    print(f"✅ Road network loaded: {len(G.nodes)} nodes, {len(G.edges)} edges")
-except Exception as e:
-    print(f"❌ Failed to load road network: {e}")
-    G = None
+# ── Download Pasay road network from Overpass API ────────────────────────────
+def download_road_network():
+    # Pasay City bounding box: south,west,north,east
+    query = """
+    [out:json][timeout:60];
+    (
+      way["highway"]["highway"!~"footway|cycleway|path|pedestrian|steps|service"]
+         (14.505,120.975,14.570,121.040);
+    );
+    out body;
+    >;
+    out skel qt;
+    """
+    print("Downloading Pasay road network from Overpass API...")
+    try:
+        resp = requests.post(
+            'https://overpass-api.de/api/interpreter',
+            data={'data': query},
+            timeout=60
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        print(f"Overpass download failed: {e}")
+        return None
 
+# ── Build NetworkX graph from Overpass data ───────────────────────────────────
+def build_graph(overpass_data):
+    G = nx.DiGraph()
+
+    # Index nodes by OSM id
+    nodes = {}
+    for el in overpass_data.get('elements', []):
+        if el['type'] == 'node':
+            nodes[el['id']] = (el['lat'], el['lon'])
+            G.add_node(el['id'], lat=el['lat'], lng=el['lon'])
+
+    # Add edges from ways
+    for el in overpass_data.get('elements', []):
+        if el['type'] != 'way':
+            continue
+        refs = el.get('nodes', [])
+        tags = el.get('tags', {})
+        oneway = tags.get('oneway', 'no') == 'yes'
+
+        # Estimate speed from highway tag
+        highway = tags.get('highway', 'residential')
+        speed_map = {
+            'motorway': 90, 'trunk': 70, 'primary': 50,
+            'secondary': 40, 'tertiary': 30, 'residential': 20,
+            'unclassified': 20, 'living_street': 10,
+        }
+        speed_kph = speed_map.get(highway, 25)
+
+        for i in range(len(refs) - 1):
+            u, v = refs[i], refs[i+1]
+            if u not in nodes or v not in nodes:
+                continue
+            dist = haversine(nodes[u], nodes[v])
+            travel_time = (dist / 1000) / speed_kph * 3600  # seconds
+
+            G.add_edge(u, v, length=dist, travel_time=travel_time, speed=speed_kph)
+            if not oneway:
+                G.add_edge(v, u, length=dist, travel_time=travel_time, speed=speed_kph)
+
+    print(f"Graph built: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
+    return G
+
+# ── Load graph (with cache) ───────────────────────────────────────────────────
+def load_graph():
+    # Check cache first
+    if os.path.exists(CACHE_FILE):
+        try:
+            print("Loading road network from cache...")
+            with open(CACHE_FILE) as f:
+                data = json.load(f)
+            G = build_graph(data)
+            if G.number_of_nodes() > 0:
+                print(f"✅ Road network loaded from cache: {G.number_of_nodes()} nodes")
+                return G
+        except Exception as e:
+            print(f"Cache load failed: {e}")
+
+    # Download fresh
+    data = download_road_network()
+    if data is None:
+        return None
+
+    # Cache for next startup
+    try:
+        with open(CACHE_FILE, 'w') as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+    G = build_graph(data)
+    if G.number_of_nodes() == 0:
+        return None
+
+    print(f"✅ Road network loaded: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
+    return G
+
+print("Loading Pasay road network...")
+G = load_graph()
 if G is None:
     print("❌ Road network unavailable — /safe-route will return 503")
 
+# ── Node lookup — nearest graph node to a coordinate ─────────────────────────
+def nearest_node(lat, lng):
+    best_node = None
+    best_dist = float('inf')
+    for node, data in G.nodes(data=True):
+        d = haversine((lat, lng), (data['lat'], data['lng']))
+        if d < best_dist:
+            best_dist = d
+            best_node = node
+    return best_node
 
 # ── Crime penalty lookup ──────────────────────────────────────────────────────
-# For each road segment, find the nearest barangay and use its crime_penalty.
-# heatmap_points: list of {lat, lng, crime_penalty} from /heatmap endpoint
-
 def get_crime_penalty(lat, lng, heatmap_points):
-    """Return the crime_penalty of the nearest barangay to a given point."""
     if not heatmap_points:
-        return 25.0  # neutral fallback
-
-    best_penalty  = 25.0
-    best_dist     = float('inf')
-
+        return 40.0
+    best_penalty = 40.0
+    best_dist    = float('inf')
     for b in heatmap_points:
-        # Fast approximate distance (no need for Haversine at barangay scale)
-        dlat = lat - b['lat']
-        dlng = lng - b['lng']
-        dist = dlat * dlat + dlng * dlng  # squared — no sqrt needed for comparison
-        if dist < best_dist:
-            best_dist    = dist
+        d = haversine((lat, lng), (b['lat'], b['lng']))
+        if d < best_dist:
+            best_dist    = d
             best_penalty = b['crime_penalty']
+    return best_penalty if best_dist < 600 else 40.0
 
-    return best_penalty
-
-
+# ── Build crime-weighted graph ────────────────────────────────────────────────
 def build_weighted_graph(heatmap_points, lambda_weight=0.5):
-    """
-    Returns a copy of G where each edge weight implements the thesis formula:
-        w'(u,v) = travel_time(u,v) * (1 + λ * normalised_crime_penalty)
-
-    This means high-crime roads cost more to traverse, so A* naturally
-    routes around them.
-
-    lambda_weight controls the crime vs speed trade-off:
-        0.0 = pure fastest route (ignore crime)
-        0.5 = balanced (default)
-        1.5 = strongly avoid crime even at significant time cost
-    """
     if G is None:
         return None
 
-    # Normalise crime penalties to 0-1 so λ is scale-independent
-    penalties = [b['crime_penalty'] for b in heatmap_points] if heatmap_points else [25]
+    penalties = [b['crime_penalty'] for b in heatmap_points] if heatmap_points else [40]
     max_p = max(penalties) or 1
     min_p = min(penalties) or 0
+    rng   = (max_p - min_p) or 1
 
     H = G.copy()
+    for u, v, data in H.edges(data=True):
+        u_data  = H.nodes[u]
+        mid_lat = (u_data['lat'] + H.nodes[v]['lat']) / 2
+        mid_lng = (u_data['lng'] + H.nodes[v]['lng']) / 2
 
-    for u, v, key, data in H.edges(data=True, keys=True):
-        # Midpoint of the edge
-        u_data = H.nodes[u]
-        v_data = H.nodes[v]
-        mid_lat = (u_data['y'] + v_data['y']) / 2
-        mid_lng = (u_data['x'] + v_data['x']) / 2
-
-        # Crime penalty at this edge's location
         raw_penalty  = get_crime_penalty(mid_lat, mid_lng, heatmap_points)
-        norm_penalty = (raw_penalty - min_p) / (max_p - min_p) if max_p > min_p else 0
+        norm_penalty = (raw_penalty - min_p) / rng
 
-        # Modified edge weight: w'(u,v) = travel_time * (1 + λ * crime_penalty)
-        base_weight  = data.get('travel_time', data.get('length', 1))
-        data['safe_weight'] = base_weight * (1 + lambda_weight * norm_penalty)
+        base = data.get('travel_time', data.get('length', 1))
+        # w'(u,v) = travel_time * (1 + λ * crime_penalty) — thesis formula
+        data['safe_weight'] = base * (1 + lambda_weight * norm_penalty)
 
     return H
 
-
-def find_safe_route(origin_lat, origin_lng, dest_lat, dest_lng,
-                    heatmap_points, lambda_weight=0.5):
-    """
-    Find the crime-weighted safest route between two points.
-
-    Returns:
-        {
-            'polyline':  [[lat,lng], ...],
-            'distance':  metres (float),
-            'duration':  seconds (float),
-            'crime_cost': total crime-weighted cost
-        }
-    """
+# ── Find route ────────────────────────────────────────────────────────────────
+def find_route(origin_lat, origin_lng, dest_lat, dest_lng,
+               heatmap_points, lambda_weight=0.5):
     if G is None:
         raise RuntimeError("Road network not loaded")
 
-    # Snap origin and destination to nearest OSM nodes
-    orig_node = ox.nearest_nodes(G, X=origin_lng,  Y=origin_lat)
-    dest_node = ox.nearest_nodes(G, X=dest_lng,    Y=dest_lat)
+    orig_node = nearest_node(origin_lat, origin_lng)
+    dest_node = nearest_node(dest_lat, dest_lng)
 
     if orig_node == dest_node:
-        raise ValueError("Origin and destination are the same node")
+        raise ValueError("Origin and destination map to the same node")
 
-    # Build crime-weighted graph
     H = build_weighted_graph(heatmap_points, lambda_weight)
 
-    # Run A* with crime-weighted edges
-    # nx.astar_path uses the Haversine heuristic via the weight parameter
     try:
-        path = nx.astar_path(H, orig_node, dest_node, weight='safe_weight')
+        path = nx.astar_path(H, orig_node, dest_node,
+                             heuristic=lambda u, v: haversine(
+                                 (H.nodes[u]['lat'], H.nodes[u]['lng']),
+                                 (H.nodes[v]['lat'], H.nodes[v]['lng'])
+                             ),
+                             weight='safe_weight')
     except nx.NetworkXNoPath:
-        # Fallback to shortest path if A* fails
         path = nx.shortest_path(H, orig_node, dest_node, weight='length')
 
-    # Extract polyline from node sequence
-    polyline = []
-    for node in path:
-        node_data = H.nodes[node]
-        polyline.append([node_data['y'], node_data['x']])  # [lat, lng]
+    polyline = [[H.nodes[n]['lat'], H.nodes[n]['lng']] for n in path]
 
-    # Calculate actual distance and duration along the path
-    total_distance = 0
-    total_duration = 0
-    total_crime_cost = 0
-
+    total_dist = total_time = total_crime = 0
     for i in range(len(path) - 1):
-        u, v = path[i], path[i + 1]
-        # Get the best (lowest weight) edge between these nodes
-        edge_data = min(
-            H[u][v].values(),
-            key=lambda d: d.get('safe_weight', float('inf'))
-        )
-        total_distance   += edge_data.get('length', 0)
-        total_duration   += edge_data.get('travel_time', 0)
-        total_crime_cost += edge_data.get('safe_weight', 0)
+        u, v   = path[i], path[i+1]
+        edge   = H[u][v]
+        total_dist  += edge.get('length', 0)
+        total_time  += edge.get('travel_time', 0)
+        total_crime += edge.get('safe_weight', 0)
 
     return {
-        'polyline':    polyline,
-        'distance':    round(total_distance, 1),
-        'duration':    round(total_duration, 1),
-        'crime_cost':  round(total_crime_cost, 2),
+        'polyline':   polyline,
+        'distance':   round(total_dist, 1),
+        'duration':   round(total_time, 1),
+        'crime_cost': round(total_crime, 2),
     }
 
-
+# ── Main export ───────────────────────────────────────────────────────────────
 def compute_three_routes(origin_lat, origin_lng, dest_lat, dest_lng, heatmap_points):
-    """
-    Compute safest, balanced, and fastest routes by varying λ.
-
-    λ = 1.5 → strongly avoids crime  (safest)
-    λ = 0.5 → balanced               (balanced)
-    λ = 0.0 → pure travel time       (fastest)
-    """
     configs = [
         {'id': 'safest',   'label': 'Safest Route',   'tag': '✅ Recommended',
          'desc': 'Avoids high crime-penalty roads.',   'lambda': 1.5},
@@ -176,28 +229,17 @@ def compute_three_routes(origin_lat, origin_lng, dest_lat, dest_lng, heatmap_poi
          'desc': 'Shortest time, higher crime risk.',  'lambda': 0.0},
     ]
 
-    # Precompute penalty stats for scoring
-    penalties = [b['crime_penalty'] for b in heatmap_points] if heatmap_points else [25]
-    max_p = max(penalties) or 1
-
     results = []
     for cfg in configs:
-        route = find_safe_route(
-            origin_lat, origin_lng, dest_lat, dest_lng,
-            heatmap_points, lambda_weight=cfg['lambda']
-        )
+        route = find_route(origin_lat, origin_lng, dest_lat, dest_lng,
+                           heatmap_points, lambda_weight=cfg['lambda'])
 
-        # Safety score: inverse of normalised crime cost
-        # Lower crime_cost = higher safety score
-        norm_cost  = min(1.0, route['crime_cost'] / (route['distance'] * 2 + 1))
-        score      = round(max(40, min(95, 95 - norm_cost * 40)))
-
-        # Format duration and distance
-        mins = round(route['duration'] / 60)
-        dur  = f"{mins} min" if mins < 60 else f"{mins//60}h {mins%60}m"
-        dist = f"{route['distance']/1000:.1f} km" if route['distance'] >= 1000 \
-               else f"{round(route['distance'])} m"
-
+        norm   = min(1.0, route['crime_cost'] / (route['distance'] * 2 + 1))
+        score  = round(max(40, min(95, 95 - norm * 40)))
+        mins   = round(route['duration'] / 60)
+        dur    = f"{mins} min" if mins < 60 else f"{mins//60}h {mins%60}m"
+        dist   = (f"{route['distance']/1000:.1f} km"
+                  if route['distance'] >= 1000 else f"{round(route['distance'])} m")
         color  = '#2D6A4F' if score >= 80 else '#EF8C2D' if score >= 60 else '#D62828'
         tag_bg = '#EBF5F0' if score >= 80 else '#FFF4E6' if score >= 60 else '#FDEAEA'
 

@@ -2,7 +2,6 @@ flask
 numpy
 scikit-learn==1.8.0
 gunicorn
-osmnx==1.9.3
 networkx>=3.0
 shapely>=2.0
 requests
