@@ -39,13 +39,25 @@ def download_road_network():
         resp = requests.post(
             'https://overpass-api.de/api/interpreter',
             data={'data': query},
+            headers={'User-Agent': 'SafeCommutePH/1.0 (thesis research project)'},
             timeout=60
         )
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
-        print(f"Overpass download failed: {e}")
-        return None
+        print(f"Primary Overpass failed: {e}, trying mirror...")
+        try:
+            resp = requests.post(
+                'https://overpass.kumi.systems/api/interpreter',
+                data={'data': query},
+                headers={'User-Agent': 'SafeCommutePH/1.0 (thesis research project)'},
+                timeout=60
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e2:
+            print(f"Mirror also failed: {e2}")
+            return None
 
 # ── Build NetworkX graph from Overpass data ───────────────────────────────────
 def build_graph(overpass_data):
