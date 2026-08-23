@@ -5,6 +5,8 @@ import os
 import csv
 from collections import defaultdict
 from datetime import datetime
+from safe_route import compute_three_routes
+
 
 app = Flask(__name__)
 
@@ -310,6 +312,63 @@ def route():
     except Exception as e:
         return jsonify({'error': f'Route calculation failed: {str(e)}'}), 500
 
+@app.route('/safe_routes', methods=['POST'])
+def safe_route():
+    """
+    Expects JSON:
+    {
+        "origin_lat":  14.5378,
+        "origin_lng":  120.9814,
+        "dest_lat":    14.5547,
+        "dest_lng":    121.0244
+    }
+ 
+    Uses the heatmap data already loaded in BARANGAYS to score roads.
+    Returns 3 routes: safest, balanced, fastest — each with a real polyline.
+    """
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': "No JSON body"}), 400
+
+        required = ['origin_lat', 'origin_lng', 'dest_lat', 'dest_lng']
+        missing = [f for f in required if f not in data]
+        if missing:
+            return jsonify({'error' : f'Missing: {missing}'}), 400
+
+        # Build heatmap_points from already-loaded BARANGAYS + current model
+        now = datetime.now()
+        month = now.month
+        day_of_week = now.weekday()
+        hour = now.hour
+
+        heatmap_points = []
+        for b in BARANGAYS:
+            features = np.array([[b['lat'], 
+                                b['lng'], month, day_of_week, hour,
+                                b['areaCrimeCount'], 
+                                b['baranagay_encoded'], 0,
+                                b['victimCount'], 
+                                b['crime_severity']
+                                            ]])
+            penalty = float(model.predictt(features)[0])
+            heatmap_points.append({
+                'lat': b['lat'],
+                'lng': b['lng'],
+                'crime_penalty': penalty,
+                'name': b['name']
+            })
+        routes = compute_three_routes(
+            data['origin_lat'], data['origin_lng'],
+            data['dest_lat'], data['dest_lng'],
+            heatmap_points
+        )
+
+        return jsonify({'routes': routes, 'generated_at': now.isoformats()})
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        return jsonify({'error': f'Routing failed {str(e)}'}), 500
 
 # ── entry point ───────────────────────────────────────────────────────────────
 
