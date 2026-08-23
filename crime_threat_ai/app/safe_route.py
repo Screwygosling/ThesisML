@@ -5,14 +5,22 @@ from functools import lru_cache
 
 print("Loading Pasay road network...")
 try:
-    G = ox.graph_from_place("Pasay City, Metro Manila, Philippines", network_type="all")
+    G = ox.graph_from_bbox(bbox=(14.570, 14.505, 121.040, 120.975),network_type="drive")
     G = ox.add_edge_speeds(G)
     G = ox.add_edge_travel_times(G)
     print(f"Road netwwork loadedd: {len(G.nodes)} nodes, {len(G.edges)} edges")
+except TypeError:
+    try:
+        G = ox.graph_from_bbox(14.570, 14.505, 121.040, 120.975, network_type="drive")
+        G = ox.add_edge_speeds(G)
+        G = ox.add_edge_travel_times(G)
+        print(f"Rooad network loaded (legacy API): {len(G.nodes)} nodes, {len(G.edges)} edges")
+    except Exception as e2:
+        print(f"Failed to loadd road network: {e2}")
 except Exception as e:
-    print(f"Failed to lload road network: {e}")
+    print(f"Failed  to load road network: {e}")
     G = None
-
+    
 # Crime Penalty Lookup
 
 def get_crime_penalty(lat, lgn, heatmap_points):
