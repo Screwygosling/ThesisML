@@ -1,6 +1,6 @@
 # safe_route.py
-# Crime-weighted A* routing using OSM road network via Overpass API
-# Bypasses OSMnx geocoding entirely — uses direct Overpass query
+# Crime-weighted A* routing using OSM road network (bundled from Overpass)
+# Implements: w'(u,v) = travel_time * (1 + lambda * crime_penalty)
 
 import networkx as nx
 import requests
@@ -8,220 +8,142 @@ import math
 import json
 import os
 
-# Check multiple cache locations — bundled file first, then temp
-BUNDLED_CACHE = os.path.join(os.path.dirname(__file__), 'pasay_roads.json')
-TEMP_CACHE    = '/tmp/pasay_graph.json'
-CACHE_FILE    = BUNDLED_CACHE if os.path.exists(BUNDLED_CACHE) else TEMP_CACHE
+BUNDLED_FILE = os.path.join(os.path.dirname(__file__), 'pasay_roads.json')
+TEMP_CACHE   = '/tmp/pasay_graph.json'
 
 # ── Haversine distance in metres ──────────────────────────────────────────────
 def haversine(a, b):
-    R = 6371000
+    R    = 6371000
     dLat = math.radians(b[0] - a[0])
     dLng = math.radians(b[1] - a[1])
-    s = (math.sin(dLat/2)**2 +
-         math.cos(math.radians(a[0])) *
-         math.cos(math.radians(b[0])) *
-         math.sin(dLng/2)**2)
-    return R * 2 * math.atan2(math.sqrt(s), math.sqrt(1-s))
+    s    = (math.sin(dLat/2)**2 +
+            math.cos(math.radians(a[0])) *
+            math.cos(math.radians(b[0])) *
+            math.sin(dLng/2)**2)
+    s = max(0.0, min(1.0, s))  # clamp to avoid sqrt(-0.0) from float rounding
+    return R * 2 * math.atan2(math.sqrt(s), math.sqrt(1 - s))
 
-# ── Download Pasay road network from Overpass API ────────────────────────────
-def download_road_network():
-    # Pasay City bounding box: south,west,north,east
-    query = """
-    [out:json][timeout:60];
-    (
-      way["highway"]["highway"!~"footway|cycleway|path|pedestrian|steps|service"]
-         (14.505,120.975,14.570,121.040);
-    );
-    out body;
-    >;
-    out skel qt;
-    """
-    print("Downloading Pasay road network from Overpass API...")
-    try:
-        resp = requests.post(
-            'https://overpass-api.de/api/interpreter',
-            data={'data': query},
-            headers={'User-Agent': 'SafeCommutePH/1.0 (thesis research project)'},
-            timeout=60
-        )
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        print(f"Primary Overpass failed: {e}, trying mirror...")
-        try:
-            resp = requests.post(
-                'https://overpass.kumi.systems/api/interpreter',
-                data={'data': query},
-                headers={'User-Agent': 'SafeCommutePH/1.0 (thesis research project)'},
-                timeout=60
-            )
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as e2:
-            print(f"Mirror also failed: {e2}")
-            return None
-
-# ── Build NetworkX graph from Overpass data ───────────────────────────────────
+# ── Build NetworkX graph from Overpass JSON ───────────────────────────────────
 def build_graph(overpass_data):
     G = nx.DiGraph()
-
-    # Index nodes by OSM id
     nodes = {}
     for el in overpass_data.get('elements', []):
         if el['type'] == 'node':
             nodes[el['id']] = (el['lat'], el['lon'])
             G.add_node(el['id'], lat=el['lat'], lng=el['lon'])
 
-    # Add edges from ways
+    speed_map = {
+        'motorway': 90, 'trunk': 70, 'primary': 50,
+        'secondary': 40, 'tertiary': 30, 'residential': 20,
+        'unclassified': 20, 'living_street': 10,
+    }
+
     for el in overpass_data.get('elements', []):
         if el['type'] != 'way':
             continue
-        refs = el.get('nodes', [])
-        tags = el.get('tags', {})
-        oneway = tags.get('oneway', 'no') == 'yes'
-
-        # Estimate speed from highway tag
+        refs    = el.get('nodes', [])
+        tags    = el.get('tags', {})
+        oneway  = tags.get('oneway', 'no') == 'yes'
         highway = tags.get('highway', 'residential')
-        speed_map = {
-            'motorway': 90, 'trunk': 70, 'primary': 50,
-            'secondary': 40, 'tertiary': 30, 'residential': 20,
-            'unclassified': 20, 'living_street': 10,
-        }
-        speed_kph = speed_map.get(highway, 25)
+        speed   = speed_map.get(highway, 25)
 
         for i in range(len(refs) - 1):
             u, v = refs[i], refs[i+1]
             if u not in nodes or v not in nodes:
                 continue
-            dist = haversine(nodes[u], nodes[v])
-            travel_time = (dist / 1000) / speed_kph * 3600  # seconds
-
-            G.add_edge(u, v, length=dist, travel_time=travel_time, speed=speed_kph)
+            dist  = haversine(nodes[u], nodes[v])
+            ttime = (dist / 1000) / speed * 3600
+            G.add_edge(u, v, length=dist, travel_time=ttime)
             if not oneway:
-                G.add_edge(v, u, length=dist, travel_time=travel_time, speed=speed_kph)
+                G.add_edge(v, u, length=dist, travel_time=ttime)
 
     print(f"Graph built: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
     return G
 
-# ── Load graph (with cache) ───────────────────────────────────────────────────
+# ── Load graph ────────────────────────────────────────────────────────────────
 def load_graph():
-    # Try bundled file first (fastest, no network needed)
-    if os.path.exists(BUNDLED_CACHE):
-        try:
-            print("Loading road network from bundled file...")
-            with open(BUNDLED_CACHE) as f:
-                data = json.load(f)
-            G = build_graph(data)
-            if G.number_of_nodes() > 0:
-                print(f"✅ Road network loaded from bundle: {G.number_of_nodes()} nodes")
-                return G
-        except Exception as e:
-            print(f"Bundle load failed: {e}")
-
-    # Try temp cache (set by a previous worker)
-    if os.path.exists(TEMP_CACHE):
-        try:
-            print("Loading road network from temp cache...")
-            with open(TEMP_CACHE) as f:
-                data = json.load(f)
-            G = build_graph(data)
-            if G.number_of_nodes() > 0:
-                print(f"✅ Road network loaded from cache: {G.number_of_nodes()} nodes")
-                return G
-        except Exception as e:
-            print(f"Cache load failed: {e}")
-
-    # Wait up to 30s for another worker to populate the cache
-    import time
-    for _ in range(6):
-        time.sleep(5)
-        if os.path.exists(TEMP_CACHE):
+    for path, label in [(BUNDLED_FILE, 'bundled file'), (TEMP_CACHE, 'temp cache')]:
+        if os.path.exists(path):
             try:
-                with open(TEMP_CACHE) as f:
+                print(f"Loading road network from {label}...")
+                with open(path) as f:
                     data = json.load(f)
                 G = build_graph(data)
                 if G.number_of_nodes() > 0:
-                    print(f"✅ Road network loaded from cache (after wait): {G.number_of_nodes()} nodes")
+                    print(f"Road network loaded: {G.number_of_nodes()} nodes")
                     return G
-            except Exception:
-                pass
-
-    # Download from Overpass as last resort
-    data = download_road_network()
-    if data is None:
-        return None
-
-    # Save to temp cache so other workers can use it
-    try:
-        with open(TEMP_CACHE, 'w') as f:
-            json.dump(data, f)
-        print("Saved to temp cache for other workers")
-    except Exception:
-        pass
-
-    G = build_graph(data)
-    if G.number_of_nodes() == 0:
-        return None
-
-    print(f"✅ Road network loaded: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
-    return G
+            except Exception as e:
+                print(f"Load from {label} failed: {e}")
+    print("No road network available")
+    return None
 
 print("Loading Pasay road network...")
 G = load_graph()
 if G is None:
-    print("❌ Road network unavailable — /safe-route will return 503")
+    print("Road network unavailable -- /safe-route will return 503")
+else:
+    print(f"Road network ready: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
 
-# ── Node lookup — nearest graph node to a coordinate ─────────────────────────
-def nearest_node(lat, lng):
-    best_node = None
-    best_dist = float('inf')
-    for node, data in G.nodes(data=True):
-        d = haversine((lat, lng), (data['lat'], data['lng']))
-        if d < best_dist:
-            best_dist = d
-            best_node = node
-    return best_node
-
-# ── Crime penalty lookup ──────────────────────────────────────────────────────
-def get_crime_penalty(lat, lng, heatmap_points):
-    if not heatmap_points:
-        return 40.0
-    best_penalty = 40.0
-    best_dist    = float('inf')
-    for b in heatmap_points:
-        d = haversine((lat, lng), (b['lat'], b['lng']))
-        if d < best_dist:
-            best_dist    = d
-            best_penalty = b['crime_penalty']
-    return best_penalty if best_dist < 600 else 40.0
+# ── Pre-compute penalty index ─────────────────────────────────────────────────
+# Maps each graph node to the crime_penalty of its nearest barangay.
+# Done once when heatmap data arrives -- O(nodes x barangays) instead of
+# O(edges x barangays) per request, which would OOM on Render's free tier.
+def build_penalty_index(heatmap_points):
+    if not heatmap_points or G is None:
+        return {}
+    index = {}
+    for node, ndata in G.nodes(data=True):
+        best_p = 40.0
+        best_d = float('inf')
+        for b in heatmap_points:
+            dlat = ndata['lat'] - b['lat']
+            dlng = ndata['lng'] - b['lng']
+            d2   = dlat * dlat + dlng * dlng  # squared degrees -- no sqrt needed
+            if d2 < best_d:
+                best_d = d2
+                best_p = b['crime_penalty']
+        # 600m ~ 0.0054 degrees, squared ~ 0.000029
+        index[node] = best_p if best_d < 0.000029 else 40.0
+    return index
 
 # ── Build crime-weighted graph ────────────────────────────────────────────────
 def build_weighted_graph(heatmap_points, lambda_weight=0.5):
     if G is None:
         return None
 
-    penalties = [b['crime_penalty'] for b in heatmap_points] if heatmap_points else [40]
-    max_p = max(penalties) or 1
-    min_p = min(penalties) or 0
-    rng   = (max_p - min_p) or 1
+    penalties    = [b['crime_penalty'] for b in heatmap_points] if heatmap_points else [40]
+    max_p        = max(penalties) or 1
+    min_p        = min(penalties) or 0
+    rng          = (max_p - min_p) or 1
+    penalty_index = build_penalty_index(heatmap_points)
 
     H = G.copy()
     for u, v, data in H.edges(data=True):
-        u_data  = H.nodes[u]
-        mid_lat = (u_data['lat'] + H.nodes[v]['lat']) / 2
-        mid_lng = (u_data['lng'] + H.nodes[v]['lng']) / 2
-
-        raw_penalty  = get_crime_penalty(mid_lat, mid_lng, heatmap_points)
+        # Average penalty of the two endpoint nodes
+        pu           = penalty_index.get(u, 40.0)
+        pv           = penalty_index.get(v, 40.0)
+        raw_penalty  = (pu + pv) / 2
         norm_penalty = (raw_penalty - min_p) / rng
-
-        base = data.get('travel_time', data.get('length', 1))
-        # w'(u,v) = travel_time * (1 + λ * crime_penalty) — thesis formula
+        base         = data.get('travel_time', data.get('length', 1))
+        # Thesis formula: w'(u,v) = travel_time * (1 + lambda * crime_penalty)
         data['safe_weight'] = base * (1 + lambda_weight * norm_penalty)
 
     return H
 
-# ── Find route ────────────────────────────────────────────────────────────────
+# ── Nearest node lookup ───────────────────────────────────────────────────────
+def nearest_node(lat, lng):
+    best_node = None
+    best_dist = float('inf')
+    for node, data in G.nodes(data=True):
+        dlat = lat - data['lat']
+        dlng = lng - data['lng']
+        d2   = dlat * dlat + dlng * dlng
+        if d2 < best_dist:
+            best_dist = d2
+            best_node = node
+    return best_node
+
+# ── Find single route ─────────────────────────────────────────────────────────
 def find_route(origin_lat, origin_lng, dest_lat, dest_lng,
                heatmap_points, lambda_weight=0.5):
     if G is None:
@@ -236,21 +158,23 @@ def find_route(origin_lat, origin_lng, dest_lat, dest_lng,
     H = build_weighted_graph(heatmap_points, lambda_weight)
 
     try:
-        path = nx.astar_path(H, orig_node, dest_node,
-                             heuristic=lambda u, v: haversine(
-                                 (H.nodes[u]['lat'], H.nodes[u]['lng']),
-                                 (H.nodes[v]['lat'], H.nodes[v]['lng'])
-                             ),
-                             weight='safe_weight')
+        path = nx.astar_path(
+            H, orig_node, dest_node,
+            heuristic=lambda u, v: haversine(
+                (H.nodes[u]['lat'], H.nodes[u]['lng']),
+                (H.nodes[v]['lat'], H.nodes[v]['lng'])
+            ),
+            weight='safe_weight'
+        )
     except nx.NetworkXNoPath:
         path = nx.shortest_path(H, orig_node, dest_node, weight='length')
 
-    polyline = [[H.nodes[n]['lat'], H.nodes[n]['lng']] for n in path]
+    polyline     = [[H.nodes[n]['lat'], H.nodes[n]['lng']] for n in path]
+    total_dist   = total_time = total_crime = 0
 
-    total_dist = total_time = total_crime = 0
     for i in range(len(path) - 1):
-        u, v   = path[i], path[i+1]
-        edge   = H[u][v]
+        u, v  = path[i], path[i+1]
+        edge  = H[u][v]
         total_dist  += edge.get('length', 0)
         total_time  += edge.get('travel_time', 0)
         total_crime += edge.get('safe_weight', 0)
@@ -265,19 +189,18 @@ def find_route(origin_lat, origin_lng, dest_lat, dest_lng,
 # ── Main export ───────────────────────────────────────────────────────────────
 def compute_three_routes(origin_lat, origin_lng, dest_lat, dest_lng, heatmap_points):
     configs = [
-        {'id': 'safest',   'label': 'Safest Route',   'tag': '✅ Recommended',
+        {'id': 'safest',   'label': 'Safest Route',   'tag': 'Recommended',
          'desc': 'Avoids high crime-penalty roads.',   'lambda': 1.5},
-        {'id': 'balanced', 'label': 'Balanced Route', 'tag': '⚖️ Balanced',
+        {'id': 'balanced', 'label': 'Balanced Route', 'tag': 'Balanced',
          'desc': 'Moderate crime avoidance.',          'lambda': 0.5},
-        {'id': 'fastest',  'label': 'Fastest Route',  'tag': '⚡ Fastest',
+        {'id': 'fastest',  'label': 'Fastest Route',  'tag': 'Fastest',
          'desc': 'Shortest time, higher crime risk.',  'lambda': 0.0},
     ]
 
     results = []
     for cfg in configs:
-        route = find_route(origin_lat, origin_lng, dest_lat, dest_lng,
-                           heatmap_points, lambda_weight=cfg['lambda'])
-
+        route  = find_route(origin_lat, origin_lng, dest_lat, dest_lng,
+                            heatmap_points, lambda_weight=cfg['lambda'])
         norm   = min(1.0, route['crime_cost'] / (route['distance'] * 2 + 1))
         score  = round(max(40, min(95, 95 - norm * 40)))
         mins   = round(route['duration'] / 60)
