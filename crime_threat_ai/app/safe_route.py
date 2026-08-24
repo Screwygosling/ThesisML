@@ -8,7 +8,10 @@ import math
 import json
 import os
 
-CACHE_FILE = '/tmp/pasay_graph.json'
+# Check multiple cache locations — bundled file first, then temp
+BUNDLED_CACHE = os.path.join(os.path.dirname(__file__), 'pasay_roads.json')
+TEMP_CACHE    = '/tmp/pasay_graph.json'
+CACHE_FILE    = BUNDLED_CACHE if os.path.exists(BUNDLED_CACHE) else TEMP_CACHE
 
 # ── Haversine distance in metres ──────────────────────────────────────────────
 def haversine(a, b):
@@ -103,11 +106,24 @@ def build_graph(overpass_data):
 
 # ── Load graph (with cache) ───────────────────────────────────────────────────
 def load_graph():
-    # Check cache first
-    if os.path.exists(CACHE_FILE):
+    # Try bundled file first (fastest, no network needed)
+    if os.path.exists(BUNDLED_CACHE):
         try:
-            print("Loading road network from cache...")
-            with open(CACHE_FILE) as f:
+            print("Loading road network from bundled file...")
+            with open(BUNDLED_CACHE) as f:
+                data = json.load(f)
+            G = build_graph(data)
+            if G.number_of_nodes() > 0:
+                print(f"✅ Road network loaded from bundle: {G.number_of_nodes()} nodes")
+                return G
+        except Exception as e:
+            print(f"Bundle load failed: {e}")
+
+    # Try temp cache (set by a previous worker)
+    if os.path.exists(TEMP_CACHE):
+        try:
+            print("Loading road network from temp cache...")
+            with open(TEMP_CACHE) as f:
                 data = json.load(f)
             G = build_graph(data)
             if G.number_of_nodes() > 0:
@@ -116,15 +132,31 @@ def load_graph():
         except Exception as e:
             print(f"Cache load failed: {e}")
 
-    # Download fresh
+    # Wait up to 30s for another worker to populate the cache
+    import time
+    for _ in range(6):
+        time.sleep(5)
+        if os.path.exists(TEMP_CACHE):
+            try:
+                with open(TEMP_CACHE) as f:
+                    data = json.load(f)
+                G = build_graph(data)
+                if G.number_of_nodes() > 0:
+                    print(f"✅ Road network loaded from cache (after wait): {G.number_of_nodes()} nodes")
+                    return G
+            except Exception:
+                pass
+
+    # Download from Overpass as last resort
     data = download_road_network()
     if data is None:
         return None
 
-    # Cache for next startup
+    # Save to temp cache so other workers can use it
     try:
-        with open(CACHE_FILE, 'w') as f:
+        with open(TEMP_CACHE, 'w') as f:
             json.dump(data, f)
+        print("Saved to temp cache for other workers")
     except Exception:
         pass
 
