@@ -1,6 +1,5 @@
 # safe_route.py
-# Crime-weighted A* routing using OSM road network (bundled from Overpass)
-# Implements: w'(u,v) = travel_time * (1 + lambda * crime_penalty)
+# Crime-weighted A* routing using OSM road network + street-level incident data
 
 import networkx as nx
 import requests
@@ -8,8 +7,9 @@ import math
 import json
 import os
 
-BUNDLED_FILE = os.path.join(os.path.dirname(__file__), 'pasay_roads.json')
-TEMP_CACHE   = '/tmp/pasay_graph.json'
+BUNDLED_FILE    = os.path.join(os.path.dirname(__file__), 'pasay_roads.json')
+TEMP_CACHE      = '/tmp/pasay_graph.json'
+INCIDENTS_FILE  = os.path.join(os.path.dirname(__file__), 'crime_incidents.json')
 
 # ── Haversine distance in metres ──────────────────────────────────────────────
 def haversine(a, b):
@@ -20,7 +20,7 @@ def haversine(a, b):
             math.cos(math.radians(a[0])) *
             math.cos(math.radians(b[0])) *
             math.sin(dLng/2)**2)
-    s = max(0.0, min(1.0, s))  # clamp to avoid sqrt(-0.0) from float rounding
+    s = max(0.0, min(1.0, s))
     return R * 2 * math.atan2(math.sqrt(s), math.sqrt(1 - s))
 
 # ── Build NetworkX graph from Overpass JSON ───────────────────────────────────
@@ -60,7 +60,7 @@ def build_graph(overpass_data):
     print(f"Graph built: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
     return G
 
-# ── Load graph ────────────────────────────────────────────────────────────────
+# ── Load road network ─────────────────────────────────────────────────────────
 def load_graph():
     for path, label in [(BUNDLED_FILE, 'bundled file'), (TEMP_CACHE, 'temp cache')]:
         if os.path.exists(path):
@@ -77,33 +77,73 @@ def load_graph():
     print("No road network available")
     return None
 
+# ── Load crime incidents ──────────────────────────────────────────────────────
+def load_incidents():
+    if os.path.exists(INCIDENTS_FILE):
+        try:
+            with open(INCIDENTS_FILE) as f:
+                incidents = json.load(f)
+            print(f"Crime incidents loaded: {len(incidents)} records")
+            return incidents
+        except Exception as e:
+            print(f"Failed to load incidents: {e}")
+    print("No incident file found -- falling back to heatmap points")
+    return []
+
 print("Loading Pasay road network...")
 G = load_graph()
 if G is None:
     print("Road network unavailable -- /safe-route will return 503")
-else:
-    print(f"Road network ready: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
 
-# ── Pre-compute penalty index ─────────────────────────────────────────────────
-# Maps each graph node to the crime_penalty of its nearest barangay.
-# Done once when heatmap data arrives -- O(nodes x barangays) instead of
-# O(edges x barangays) per request, which would OOM on Render's free tier.
-def build_penalty_index(heatmap_points):
-    if not heatmap_points or G is None:
-        return {}
-    index = {}
-    for node, ndata in G.nodes(data=True):
+print("Loading crime incident data...")
+INCIDENTS = load_incidents()
+
+# ── Street-level crime penalty lookup ────────────────────────────────────────
+# Uses actual incident coordinates with a tight influence radius (200m)
+# so only roads that genuinely pass near a crime scene are penalized.
+# Falls back to heatmap barangay data if no incident file is available.
+def get_incident_penalty(lat, lng, incidents, heatmap_points, radius=200):
+    total_penalty = 0.0
+
+    if incidents:
+        # Sum weighted penalties from all incidents within radius
+        # Closer incidents contribute more (inverse distance weighting)
+        for inc in incidents:
+            d = haversine((lat, lng), (inc['lat'], inc['lng']))
+            if d < radius:
+                weight         = 1.0 - (d / radius)  # 1.0 at same spot, 0 at radius
+                total_penalty += inc['crime_penalty'] * weight
+
+        # Normalise to 0-100 scale
+        # A single severity-5 incident at 0m contributes 100 * 1.0 = 100
+        # Multiple incidents accumulate — cap at 100
+        return min(100.0, total_penalty)
+
+    # Fallback: use heatmap barangay data
+    if heatmap_points:
         best_p = 40.0
         best_d = float('inf')
         for b in heatmap_points:
-            dlat = ndata['lat'] - b['lat']
-            dlng = ndata['lng'] - b['lng']
-            d2   = dlat * dlat + dlng * dlng  # squared degrees -- no sqrt needed
-            if d2 < best_d:
-                best_d = d2
+            d = haversine((lat, lng), (b['lat'], b['lng']))
+            if d < best_d:
+                best_d = d
                 best_p = b['crime_penalty']
-        # 600m ~ 0.0054 degrees, squared ~ 0.000029
-        index[node] = best_p if best_d < 0.000029 else 40.0
+        return best_p if best_d < 600 else 40.0
+
+    return 40.0  # neutral fallback
+
+# ── Pre-compute penalty index for all graph nodes ────────────────────────────
+# Done once per request — O(nodes x incidents) instead of O(edges x incidents)
+def build_penalty_index(heatmap_points):
+    if G is None:
+        return {}
+    incidents = INCIDENTS  # use bundled incident data
+    index = {}
+    for node, ndata in G.nodes(data=True):
+        index[node] = get_incident_penalty(
+            ndata['lat'], ndata['lng'],
+            incidents, heatmap_points
+        )
     return index
 
 # ── Build crime-weighted graph ────────────────────────────────────────────────
@@ -111,15 +151,15 @@ def build_weighted_graph(heatmap_points, lambda_weight=0.5):
     if G is None:
         return None
 
-    penalties    = [b['crime_penalty'] for b in heatmap_points] if heatmap_points else [40]
-    max_p        = max(penalties) or 1
-    min_p        = min(penalties) or 0
-    rng          = (max_p - min_p) or 1
+    # Get penalty range for normalisation
     penalty_index = build_penalty_index(heatmap_points)
+    all_penalties = list(penalty_index.values())
+    max_p = max(all_penalties) if all_penalties else 100
+    min_p = min(all_penalties) if all_penalties else 0
+    rng   = (max_p - min_p) or 1
 
     H = G.copy()
     for u, v, data in H.edges(data=True):
-        # Average penalty of the two endpoint nodes
         pu           = penalty_index.get(u, 40.0)
         pv           = penalty_index.get(v, 40.0)
         raw_penalty  = (pu + pv) / 2
@@ -169,8 +209,8 @@ def find_route(origin_lat, origin_lng, dest_lat, dest_lng,
     except nx.NetworkXNoPath:
         path = nx.shortest_path(H, orig_node, dest_node, weight='length')
 
-    polyline     = [[H.nodes[n]['lat'], H.nodes[n]['lng']] for n in path]
-    total_dist   = total_time = total_crime = 0
+    polyline   = [[H.nodes[n]['lat'], H.nodes[n]['lng']] for n in path]
+    total_dist = total_time = total_crime = 0
 
     for i in range(len(path) - 1):
         u, v  = path[i], path[i+1]
@@ -190,11 +230,11 @@ def find_route(origin_lat, origin_lng, dest_lat, dest_lng,
 def compute_three_routes(origin_lat, origin_lng, dest_lat, dest_lng, heatmap_points):
     configs = [
         {'id': 'safest',   'label': 'Safest Route',   'tag': 'Recommended',
-         'desc': 'Avoids high crime-penalty roads.',   'lambda': 1.5},
+         'desc': 'Avoids roads near recorded crime incidents.', 'lambda': 1.5},
         {'id': 'balanced', 'label': 'Balanced Route', 'tag': 'Balanced',
-         'desc': 'Moderate crime avoidance.',          'lambda': 0.5},
+         'desc': 'Moderate crime avoidance.',                   'lambda': 0.5},
         {'id': 'fastest',  'label': 'Fastest Route',  'tag': 'Fastest',
-         'desc': 'Shortest time, higher crime risk.',  'lambda': 0.0},
+         'desc': 'Shortest time, higher crime risk.',           'lambda': 0.0},
     ]
 
     results = []
