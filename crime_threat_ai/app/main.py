@@ -2,10 +2,10 @@ from flask import Flask, request, jsonify
 import pickle
 import numpy as np
 import os
+import json
 import csv
 from collections import defaultdict
 from datetime import datetime
-from safe_route import compute_three_routes
 
 app = Flask(__name__)
 
@@ -313,50 +313,26 @@ def route():
 
 
 
-@app.route('/safe-route', methods=['POST'])
-def safe_route_endpoint():
+@app.route('/incidents', methods=['GET'])
+def incidents():
+    """
+    Returns individual crime incident points for street-level heatmap.
+    Each point has lat, lng, crime_penalty, severity, and offense type.
+    """
     try:
-        data = request.get_json()
-        if not data:
-            return jsonify({'error': 'No JSON body'}), 400
+        incidents_file = os.path.join(os.path.dirname(__file__), 'crime_incidents.json')
+        if not os.path.exists(incidents_file):
+            return jsonify({'error': 'Incident data not found'}), 404
 
-        required = ['origin_lat', 'origin_lng', 'dest_lat', 'dest_lng']
-        missing  = [f for f in required if f not in data]
-        if missing:
-            return jsonify({'error': f'Missing: {missing}'}), 400
+        with open(incidents_file) as f:
+            data = json.load(f)
 
-        now         = datetime.now()
-        month       = now.month
-        day_of_week = now.weekday()
-        hour        = now.hour
-
-        heatmap_points = []
-        for b in BARANGAYS:
-            features = np.array([[
-                b['lat'], b['lng'], month, day_of_week, hour,
-                b['areaCrimeCount'], b['barangay_encoded'], 0,
-                b['victimCount'], b['crime_severity']
-            ]])
-            penalty = float(model.predict(features)[0])
-            heatmap_points.append({
-                'lat':           b['lat'],
-                'lng':           b['lng'],
-                'crime_penalty': penalty,
-                'name':          b['name'],
-            })
-
-        routes = compute_three_routes(
-            data['origin_lat'], data['origin_lng'],
-            data['dest_lat'],   data['dest_lng'],
-            heatmap_points
-        )
-
-        return jsonify({'routes': routes, 'generated_at': now.isoformat()})
-
-    except ValueError as e:
-        return jsonify({'error': str(e)}), 400
+        return jsonify({
+            'incidents': data,
+            'count':     len(data),
+        })
     except Exception as e:
-        return jsonify({'error': f'Routing failed: {str(e)}'}), 500
+        return jsonify({'error': str(e)}), 500
 
 
 # ── entry point ───────────────────────────────────────────────────────────────
