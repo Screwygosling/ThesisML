@@ -232,12 +232,15 @@ def compute_three_routes(origin_lat, origin_lng, dest_lat, dest_lng, heatmap_poi
     def color(s):  return '#2D6A4F' if s >= 80 else '#EF8C2D' if s >= 60 else '#D62828'
     def tag_bg(s): return '#EBF5F0' if s >= 80 else '#FFF4E6' if s >= 60 else '#FDEAEA'
 
-    results = []
-    for cfg, route in [
+    configs = [
         {'id':'safest',   'label':'Safest Route',   'tag':'Recommended', 'desc':'Avoids roads near recorded crime incidents.'},
         {'id':'balanced', 'label':'Balanced Route', 'tag':'Balanced',    'desc':'Moderate crime avoidance.'},
         {'id':'fastest',  'label':'Fastest Route',  'tag':'Fastest',     'desc':'Shortest time, higher crime risk.'},
-    ], [safe_route, balanced_route, fastest_route]:
+    ]
+    routes = [safe_route, balanced_route, fastest_route]
+
+    results = []
+    for cfg, route in zip(configs, routes):
         s = score(route)
         results.append({
             **cfg,
