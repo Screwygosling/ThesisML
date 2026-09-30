@@ -93,6 +93,24 @@ if G is None:
 print("Loading crime incident data...")
 INCIDENTS = load_incidents()
 
+# ── Compute routable node set ─────────────────────────────────────────────────
+# A directed OSM graph often has disconnected pockets (one-way quirks, unmapped
+# connectors). Snapping origin/dest to those causes NetworkXNoPath. Restrict
+# nearest-node search to the largest strongly-connected component so any two
+# snapped points are always guaranteed to reach each other.
+ROUTABLE_NODES = set()
+
+def compute_routable_nodes():
+    global ROUTABLE_NODES
+    if G is None or G.number_of_nodes() == 0:
+        return
+    largest_scc = max(nx.strongly_connected_components(G), key=len)
+    ROUTABLE_NODES = largest_scc
+    print(f"Routable component: {len(ROUTABLE_NODES)} of {G.number_of_nodes()} nodes")
+    print(f"Excluded {G.number_of_nodes() - len(ROUTABLE_NODES)} unreachable nodes from routing")
+
+compute_routable_nodes()
+
 # ── Pre-compute penalty index at startup ──────────────────────────────────────
 # Runs once when server starts — O(nodes x incidents)
 # Avoids recomputing on every request which causes OOM on Render free tier
@@ -162,7 +180,9 @@ print("Weighted graphs ready.")
 def nearest_node(lat, lng):
     best_node = None
     best_dist = float('inf')
-    for node, data in G.nodes(data=True):
+    candidates = ROUTABLE_NODES if ROUTABLE_NODES else G.nodes
+    for node in candidates:
+        data = G.nodes[node]
         dlat = lat - data['lat']
         dlng = lng - data['lng']
         d2   = dlat * dlat + dlng * dlng
