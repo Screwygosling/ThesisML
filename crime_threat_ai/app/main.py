@@ -372,7 +372,7 @@ def safe_route_endpoint():
             mode=mode
         )
 
-        return jsonify({'routes': routes, 'generated_at': now.isoformat()})
+        return jsonify({'routes': routes, 'mode': mode, 'generated_at': now.isoformat()})
 
     except ValueError as e:
         return jsonify({'error': str(e)}), 400
