@@ -369,6 +369,7 @@ def safe_route_endpoint():
             data['origin_lat'], data['origin_lng'],
             data['dest_lat'],   data['dest_lng'],
             heatmap_points
+            mode=mode
         )
 
         return jsonify({'routes': routes, 'generated_at': now.isoformat()})
