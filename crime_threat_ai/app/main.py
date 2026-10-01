@@ -341,6 +341,10 @@ def safe_route_endpoint():
         if missing:
             return jsonify({'error': f'Missing fields: {missing}'}), 400
 
+        mode = data.get('mode', 'driving')
+        if mode not in ('driving', 'walking'):
+            return jsonify({{'error': f"Invalid mode: {mode!r}. Must be 'driving' or 'walking'."}}), 400
+
         now         = datetime.now()
         month       = now.month
         day_of_week = now.weekday()

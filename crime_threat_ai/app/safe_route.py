@@ -7,9 +7,12 @@ import math
 import json
 import os
 
-BUNDLED_FILE   = os.path.join(os.path.dirname(__file__), 'pasay_roads.json')
-TEMP_CACHE     = '/tmp/pasay_graph.json'
-INCIDENTS_FILE = os.path.join(os.path.dirname(__file__), 'crime_incidents.json')
+BUNDLED_FILE      = os.path.join(os.path.dirname(__file__), 'pasay_roads.json')
+BUNDLED_FILE_WALK = os.path.join(os.path.dirname(__file__), 'pasay_roads_walk.json')
+INCIDENTS_FILE    = os.path.join(os.path.dirname(__file__), 'crime_incidents.json')
+
+WALK_SPEED_KMH   = 5.0
+NO_WALK_HIGHWAYS = {'motorway', 'trunk', 'motorway_link', 'trunk_link'}
 
 # ── Haversine ─────────────────────────────────────────────────────────────────
 def haversine(a, b):
@@ -24,7 +27,7 @@ def haversine(a, b):
     return R * 2 * math.atan2(math.sqrt(s), math.sqrt(1 - s))
 
 # ── Build graph from Overpass JSON ────────────────────────────────────────────
-def build_graph(overpass_data):
+def build_graph(overpass_data, mode='driving'):
     G = nx.DiGraph()
     nodes = {}
     for el in overpass_data.get('elements', []):
@@ -42,8 +45,17 @@ def build_graph(overpass_data):
             continue
         refs    = el.get('nodes', [])
         tags    = el.get('tags', {})
+        highway = tags.get('highway', 'residential')
         oneway  = tags.get('oneway', 'no') == 'yes'
-        speed   = speed_map.get(tags.get('highway', 'residential'), 25)
+
+        if mode == 'walking':
+            if highway in NO_WALK_HIGHWAYS:
+                continue
+            speed  = WALK_SPEED_KMH
+            oneway = False
+        else:
+            speed = speed_map.get(highway, 25)
+
         for i in range(len(refs) - 1):
             u, v = refs[i], refs[i+1]
             if u not in nodes or v not in nodes:
@@ -54,20 +66,22 @@ def build_graph(overpass_data):
             if not oneway:
                 G.add_edge(v, u, length=dist, travel_time=ttime)
 
-    print(f"Graph built: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
+    print(f"Graph built ({mode}): {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
     return G
 
 # ── Load road network ─────────────────────────────────────────────────────────
-def load_graph():
-    for path, label in [(BUNDLED_FILE, 'bundled file'), (TEMP_CACHE, 'temp cache')]:
+def load_graph(mode='driving'):
+    bundled = BUNDLED_FILE_WALK if mode == 'walking' else BUNDLED_FILE
+    cache   = f'/tmp/pasay_graph_{mode}.json'
+    for path, label in [(bundled, f'bundled file ({mode})'), (cache, 'temp cache')]:
         if os.path.exists(path):
             try:
                 print(f"Loading road network from {label}...")
                 with open(path) as f:
                     data = json.load(f)
-                G = build_graph(data)
+                G = build_graph(data, mode=mode)
                 if G.number_of_nodes() > 0:
-                    print(f"Road network loaded: {G.number_of_nodes()} nodes")
+                    print(f"Road network loaded ({mode}): {G.number_of_nodes()} nodes")
                     return G
             except Exception as e:
                 print(f"Load from {label} failed: {e}")
@@ -85,104 +99,88 @@ def load_incidents():
             print(f"Failed to load incidents: {e}")
     return []
 
-print("Loading Pasay road network...")
-G = load_graph()
-if G is None:
-    print("Road network unavailable")
-
 print("Loading crime incident data...")
 INCIDENTS = load_incidents()
 
+print("Loading Pasay road network (driving)...")
+G = load_graph(mode='driving')
+if G is None:
+    print("Driving road network unavailable")
+
+print("Loading Pasay road network (walking)...")
+G_WALK = load_graph(mode='walking')
+if G_WALK is None:
+    print("Walking road network unavailable — walking mode will fall back to driving graph")
+
 # ── Compute routable node set ─────────────────────────────────────────────────
-# A directed OSM graph often has disconnected pockets (one-way quirks, unmapped
-# connectors). Snapping origin/dest to those causes NetworkXNoPath. Restrict
-# nearest-node search to the largest strongly-connected component so any two
-# snapped points are always guaranteed to reach each other.
-ROUTABLE_NODES = set()
+def compute_routable_nodes(graph):
+    if graph is None or graph.number_of_nodes() == 0:
+        return set()
+    largest_scc = max(nx.strongly_connected_components(graph), key=len)
+    print(f"Routable component: {len(largest_scc)} of {graph.number_of_nodes()} nodes")
+    print(f"Excluded {graph.number_of_nodes() - len(largest_scc)} unreachable nodes")
+    return largest_scc
 
-def compute_routable_nodes():
-    global ROUTABLE_NODES
-    if G is None or G.number_of_nodes() == 0:
-        return
-    largest_scc = max(nx.strongly_connected_components(G), key=len)
-    ROUTABLE_NODES = largest_scc
-    print(f"Routable component: {len(ROUTABLE_NODES)} of {G.number_of_nodes()} nodes")
-    print(f"Excluded {G.number_of_nodes() - len(ROUTABLE_NODES)} unreachable nodes from routing")
-
-compute_routable_nodes()
+ROUTABLE_NODES      = compute_routable_nodes(G)
+ROUTABLE_NODES_WALK = compute_routable_nodes(G_WALK) if G_WALK is not None else set()
 
 # ── Pre-compute penalty index at startup ──────────────────────────────────────
-# Runs once when server starts — O(nodes x incidents)
-# Avoids recomputing on every request which causes OOM on Render free tier
-PENALTY_INDEX = {}
-PENALTY_MIN   = 40.0
-PENALTY_MAX   = 40.0
-
-def precompute_penalty_index():
-    global PENALTY_INDEX, PENALTY_MIN, PENALTY_MAX
-    if G is None or not INCIDENTS:
-        print("Skipping penalty pre-computation")
-        return
-
-    print(f"Pre-computing penalty index ({G.number_of_nodes()} nodes x {len(INCIDENTS)} incidents)...")
+def precompute_penalty_index(graph):
+    if graph is None or not INCIDENTS:
+        return {}, 0.0, 0.0
     index = {}
-    for node, ndata in G.nodes(data=True):
+    for node, ndata in graph.nodes(data=True):
         best_p = 0.0
         for inc in INCIDENTS:
             dlat = ndata['lat'] - inc['lat']
             dlng = ndata['lng'] - inc['lng']
             d2   = dlat * dlat + dlng * dlng
-            # 200m radius in degrees squared ~ 0.0000032
             if d2 < 0.0000032:
-                # Weight by proximity — closer incidents contribute more
                 weight  = 1.0 - (d2 / 0.0000032)
                 best_p += inc['crime_penalty'] * weight
-        index[node] = min(100.0, best_p)  # cap at 100
+        index[node] = min(100.0, best_p)
+    vals = list(index.values()) or [0.0]
+    return index, min(vals), max(vals)
 
-    PENALTY_INDEX = index
-    vals          = list(index.values())
-    PENALTY_MIN   = min(vals)
-    PENALTY_MAX   = max(vals)
-    print(f"Penalty index ready. Range: {PENALTY_MIN:.1f} - {PENALTY_MAX:.1f}")
-    high = sum(1 for v in vals if v > 50)
-    print(f"High-crime nodes (>50): {high} of {len(vals)}")
-
-precompute_penalty_index()
+PENALTY_INDEX, PENALTY_MIN, PENALTY_MAX = precompute_penalty_index(G)
+PENALTY_INDEX_WALK, PENALTY_MIN_WALK, PENALTY_MAX_WALK = precompute_penalty_index(G_WALK) if G_WALK is not None else ({}, 0.0, 0.0)
+print(f"Driving penalty range: {PENALTY_MIN:.1f} - {PENALTY_MAX:.1f}")
+print(f"Walking penalty range: {PENALTY_MIN_WALK:.1f} - {PENALTY_MAX_WALK:.1f}")
 
 # ── Build crime-weighted graph ────────────────────────────────────────────────
-def build_weighted_graph(lambda_weight=0.5):
-    if G is None:
+def build_weighted_graph(graph, penalty_index, p_min, p_max, lambda_weight=0.5):
+    if graph is None:
         return None
-
-    rng = (PENALTY_MAX - PENALTY_MIN) or 1
-    H   = G.copy()
-
+    rng = (p_max - p_min) or 1
+    H   = graph.copy()
     for u, v, data in H.edges(data=True):
-        pu           = PENALTY_INDEX.get(u, 0.0)
-        pv           = PENALTY_INDEX.get(v, 0.0)
+        pu           = penalty_index.get(u, 0.0)
+        pv           = penalty_index.get(v, 0.0)
         raw_penalty  = (pu + pv) / 2
-        norm_penalty = (raw_penalty - PENALTY_MIN) / rng
+        norm_penalty = (raw_penalty - p_min) / rng
         base         = data.get('travel_time', data.get('length', 1))
-        # Thesis formula: w'(u,v) = travel_time * (1 + lambda * crime_penalty)
         data['safe_weight'] = base * (1 + lambda_weight * norm_penalty)
-
     return H
 
-# ── Cache weighted graphs at startup too ──────────────────────────────────────
-# Build all three lambda variants once so requests are instant
 print("Pre-building weighted graphs...")
-H_SAFE     = build_weighted_graph(lambda_weight=1.5) if G else None
-H_BALANCED = build_weighted_graph(lambda_weight=0.5) if G else None
-H_FASTEST  = build_weighted_graph(lambda_weight=0.0) if G else None
+H_SAFE     = build_weighted_graph(G, PENALTY_INDEX, PENALTY_MIN, PENALTY_MAX, lambda_weight=1.5) if G is not None else None
+H_BALANCED = build_weighted_graph(G, PENALTY_INDEX, PENALTY_MIN, PENALTY_MAX, lambda_weight=0.5) if G is not None else None
+H_FASTEST  = build_weighted_graph(G, PENALTY_INDEX, PENALTY_MIN, PENALTY_MAX, lambda_weight=0.0) if G is not None else None
+
+H_SAFE_WALK     = build_weighted_graph(G_WALK, PENALTY_INDEX_WALK, PENALTY_MIN_WALK, PENALTY_MAX_WALK, lambda_weight=1.5) if G_WALK is not None else None
+H_BALANCED_WALK = build_weighted_graph(G_WALK, PENALTY_INDEX_WALK, PENALTY_MIN_WALK, PENALTY_MAX_WALK, lambda_weight=0.5) if G_WALK is not None else None
+H_FASTEST_WALK  = build_weighted_graph(G_WALK, PENALTY_INDEX_WALK, PENALTY_MIN_WALK, PENALTY_MAX_WALK, lambda_weight=0.0) if G_WALK is not None else None
 print("Weighted graphs ready.")
 
 # ── Nearest node ──────────────────────────────────────────────────────────────
-def nearest_node(lat, lng):
+def nearest_node(lat, lng, graph=None, routable=None):
+    graph    = graph if graph is not None else G
+    routable = routable if routable else ROUTABLE_NODES
     best_node = None
     best_dist = float('inf')
-    candidates = ROUTABLE_NODES if ROUTABLE_NODES else G.nodes
+    candidates = routable if routable else graph.nodes
     for node in candidates:
-        data = G.nodes[node]
+        data = graph.nodes[node]
         dlat = lat - data['lat']
         dlng = lng - data['lng']
         d2   = dlat * dlat + dlng * dlng
@@ -223,20 +221,26 @@ def find_route_on_graph(H, orig_node, dest_node):
     }
 
 # ── Main export ───────────────────────────────────────────────────────────────
-def compute_three_routes(origin_lat, origin_lng, dest_lat, dest_lng, heatmap_points=None):
-    if G is None or H_SAFE is None:
+def compute_three_routes(origin_lat, origin_lng, dest_lat, dest_lng, heatmap_points=None, mode='driving'):
+    if mode == 'walking' and G_WALK is not None:
+        graph, routable = G_WALK, ROUTABLE_NODES_WALK
+        h_safe, h_bal, h_fast = H_SAFE_WALK, H_BALANCED_WALK, H_FASTEST_WALK
+    else:
+        graph, routable = G, ROUTABLE_NODES
+        h_safe, h_bal, h_fast = H_SAFE, H_BALANCED, H_FASTEST
+
+    if graph is None or h_safe is None:
         raise RuntimeError("Road network not loaded")
 
-    orig_node = nearest_node(origin_lat, origin_lng)
-    dest_node = nearest_node(dest_lat, dest_lng)
+    orig_node = nearest_node(origin_lat, origin_lng, graph, routable)
+    dest_node = nearest_node(dest_lat, dest_lng, graph, routable)
 
     if orig_node == dest_node:
         raise ValueError("Origin and destination map to the same node")
 
-    # Use pre-built graphs — no computation needed per request
-    safe_route     = find_route_on_graph(H_SAFE,     orig_node, dest_node)
-    balanced_route = find_route_on_graph(H_BALANCED, orig_node, dest_node)
-    fastest_route  = find_route_on_graph(H_FASTEST,  orig_node, dest_node)
+    safe_route     = find_route_on_graph(h_safe, orig_node, dest_node)
+    balanced_route = find_route_on_graph(h_bal,  orig_node, dest_node)
+    fastest_route  = find_route_on_graph(h_fast, orig_node, dest_node)
 
     def fmt_time(s):
         m = round(s / 60)
