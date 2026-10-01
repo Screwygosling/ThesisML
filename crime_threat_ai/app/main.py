@@ -368,7 +368,7 @@ def safe_route_endpoint():
         routes = compute_three_routes(
             data['origin_lat'], data['origin_lng'],
             data['dest_lat'],   data['dest_lng'],
-            heatmap_points
+            heatmap_points,
             mode=mode
         )
 
