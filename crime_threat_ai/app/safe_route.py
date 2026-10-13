@@ -160,6 +160,7 @@ def build_weighted_graph(graph, penalty_index, p_min, p_max, lambda_weight=0.5):
         norm_penalty = (raw_penalty - p_min) / rng
         base         = data.get('travel_time', data.get('length', 1))
         data['safe_weight'] = base * (1 + lambda_weight * norm_penalty)
+        data['raw_penalty'] = raw_penalty   # lambda-independent, comparable across all three routes
     return H
 
 print("Pre-building weighted graphs...")
@@ -211,7 +212,7 @@ def find_route_on_graph(H, orig_node, dest_node):
         edge  = H[u][v]
         total_dist  += edge.get('length', 0)
         total_time  += edge.get('travel_time', 0)
-        total_crime += edge.get('safe_weight', 0)
+        total_crime += edge.get('raw_penalty', 0)   # ← changed from 'safe_weight'
 
     return {
         'polyline':   polyline,
